@@ -5,7 +5,7 @@ Mock implementation of the uploaded `AIC26 - Backend` OpenAPI contract.
 ## What is mocked
 
 - Video files are served from `data/videos` with HTTP range support.
-- Three video slots are recognized by default: `video-1`, `video-2`, `video-3`.
+- Three video slots are recognized by default: `L21_V005`, `L21_V006`, `L21_V007`.
 - Keyframes are deterministic mock records and return generated JPEG placeholders.
 - OCR and transcript text use Lorem Ipsum-style mock text.
 - Semantic/exact/temporal/detection/similarity queries return deterministic mock results; no ML model is executed.
@@ -16,9 +16,9 @@ Mock implementation of the uploaded `AIC26 - Backend` OpenAPI contract.
 Put your files here and rename them to:
 
 ```text
-data/videos/video-1.webm
-data/videos/video-2.webm
-data/videos/video-3.webm
+data/videos/L21_V005.webm
+data/videos/L21_V006.webm
+data/videos/L21_V007.webm
 ```
 
 The API also accepts `.mp4`, `.mkv`, and `.mov` if configured through `VIDEO_EXTENSIONS`.
@@ -57,4 +57,4 @@ Default URL: `http://localhost:3000`
 - `GET /logs?limit=50&offset=0`
 - `GET /logs/:request_id`
 
-The endpoint shapes, response property names, enums, defaults, and major validation constraints follow the uploaded OpenAPI document. fileciteturn0file0L1-L1
+The endpoint shapes, response property names, enums, defaults, and major validation constraints follow the OpenAPI `openapi.json`
