@@ -31,11 +31,26 @@ type LogEntry = { request_id: string; timestamp: string; query: string; limit: n
 
 type VideoInfo = { id: string; fps: number; durationMs: number; ext: string };
 
-const VIDEOS: VideoInfo[] = [
-  { id: 'L21_V005', fps: 30, durationMs: (15*60+43)*1000, ext: '.webm' },
-  { id: 'L21_V006', fps: 30, durationMs: (17*60+15)*1000, ext: '.webm' },
-  { id: 'L21_V007', fps: 30, durationMs: 14*60*1000, ext: '.webm' },
-];
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm']);
+
+const VIDEO_DURATIONS: Record<string, number> = {
+  L21_V005: (15 * 60 + 43) * 1000,
+  L21_V006: (17 * 60 + 15) * 1000,
+  L21_V007: 14 * 60 * 1000,
+};
+
+const VIDEOS: VideoInfo[] = fs.readdirSync(VIDEO_DIR)
+  .filter(filename => VIDEO_EXTENSIONS.has(path.extname(filename).toLowerCase()))
+  .map(filename => {
+    const ext = path.extname(filename).toLowerCase();
+
+    return {
+      id: path.basename(filename, ext),
+      fps: 30,
+      durationMs: VIDEO_DURATIONS[path.basename(filename, ext)] ?? 15 * 60 * 1000,
+      ext,
+    };
+  });
 
 const LOREM = [
   'Lorem ipsum dolor sit amet, consectetur adipiscing elit.',
@@ -426,6 +441,40 @@ app.get('/logs/:request_id', (req, res) => {
   const found = logs.find(x => x.request_id === req.params.request_id);
   if (!found) return res.status(404).send('Not found');
   res.json(found);
+});
+
+let sharedText = '';
+let lastWhisperSetTime = 0;
+
+app.post('/whisper', (req, res) => {
+  const { message } = req.body ?? {};
+  if (typeof message !== 'string') {
+    return jsonError(res, 422, 'message is required and must be a string');
+  }
+
+  const now = Date.now();
+  const cooldownMs = 3000;
+  if (now - lastWhisperSetTime < cooldownMs) {
+    const remaining = Math.ceil(cooldownMs - (now - lastWhisperSetTime));
+    return res.status(429).json({
+      detail: `Cooldown active. Please wait ${remaining}ms before setting the whisper text again.`
+    });
+  }
+
+  sharedText = message;
+  lastWhisperSetTime = now;
+
+  res.json({ status: 'ok', message: sharedText });
+});
+
+app.get('/whisper', (req, res) => {
+  // If you also want to support checking or passing a message via query/body:
+  const queryMessage = req.body?.message ?? req.query?.message;
+  
+  res.json({
+    message: sharedText,
+    match: queryMessage !== undefined ? sharedText === queryMessage : undefined
+  });
 });
 
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
