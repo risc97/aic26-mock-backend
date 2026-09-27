@@ -18,9 +18,20 @@ const KEYFRAME_DIR = path.join(ROOT, 'data', 'keyframes', 'generated');
 fs.mkdirSync(VIDEO_DIR, { recursive: true });
 fs.mkdirSync(KEYFRAME_DIR, { recursive: true });
 
-type SimilarModel = 'siglip' | 'siglip2' | 'pe';
-type QueryModel = SimilarModel | 'gte' | 'owlv2-base' | 'owlv2-large';
+const CORE_MODELS = ['siglip', 'siglip2', 'pe'] as const;
+type CoreModel = (typeof CORE_MODELS)[number];
+
+const SIMILAR_MODELS = ['siglip', 'siglip2', 'pe', 'dinov3'] as const;
+type SimilarModel = (typeof SIMILAR_MODELS)[number];
+
+const TEMPORAL_MODELS = ['siglip', 'siglip2', 'gte', 'pe', 'owlv2-base', 'owlv2-large'] as const;
+type QueryModel = CoreModel | 'gte' | 'owlv2-base' | 'owlv2-large';
+
+const DETECT_MODELS = ['owlv2-base', 'owlv2-large'] as const;
+type DetectModel = (typeof DETECT_MODELS)[number];
+
 type LogMode = 'keyframe' | 'transcript_semantic' | 'transcript_exact' | 'ocr_exact' | 'temporal' | 'detect' | 'temporal_detect';
+type Region = 'left' | 'right' | 'center' | 'top' | 'bottom';
 
 type Item = { keyframe_id: string; video_id: string; timestamp_ms: number; frame_idx: number; video_fps: number; score?: number | null };
 type OcrItem = Item & { score: number; text: string };
@@ -28,10 +39,12 @@ type TranscriptItem = { video_id: string; transcript_id: string; text: string; t
 type TemporalMatch = Item & { score: number; stage: number; query: string; rank: number };
 type TemporalItem = { rank: number; video_id: string; score: number; length: number; matches?: TemporalMatch[]; skipped_stages?: number[] };
 type LogEntry = { request_id: string; timestamp: string; query: string; limit: number; mode: LogMode; model?: QueryModel | null; results: unknown[]; total: number };
+type DetectObjectNorm = { phrase: string; min_count: number; min_score: number; region: Region | null; min_area: number; max_area: number };
 
 type VideoInfo = { id: string; fps: number; durationMs: number; ext: string };
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.webm']);
+const REGIONS: Set<Region> = new Set(['left', 'right', 'center', 'top', 'bottom']);
 
 const VIDEO_DURATIONS: Record<string, number> = {
   L21_V005: (15 * 60 + 43) * 1000,
@@ -163,6 +176,9 @@ function keyframesFor(video: VideoInfo): Item[] {
     video_fps: video.fps,
   }));
 }
+function allKeyframesFlat(): Item[] {
+  return VIDEOS.flatMap(v => keyframesFor(v));
+}
 function keyframeById(videoId: string, keyframeId: string) {
   const video = videoFor(videoId);
   return video ? keyframesFor(video).find(k => k.keyframe_id === keyframeId) : undefined;
@@ -178,6 +194,31 @@ function matchesText(text: string, query: string, phrase: boolean) {
   if (phrase) return t.includes(q);
   return queryTokens(q).every(tok => t.includes(tok));
 }
+
+// Strips Vietnamese diacritics (NFD decomposition + combining marks + đ/Đ) so "fuzzy" matching
+// can tolerate missing tone/diacritic marks, per OcrQueryRequest/TranscriptExactQueryRequest docs.
+function stripDiacritics(s: string) {
+  return s
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D');
+}
+
+// fuzzy = true (default): tokens may appear in any order, diacritic/typo-insensitive.
+// fuzzy = false: exact, contiguous, in-order phrase match with correct diacritics.
+function matchesTextFlexible(text: string, query: string, fuzzy: boolean) {
+  const q = query.trim().toLowerCase();
+  if (!q) return false;
+
+  if (!fuzzy) return text.toLowerCase().includes(q);
+
+  const normText = stripDiacritics(text.toLowerCase());
+  const normQuery = stripDiacritics(q);
+  const tokens = normQuery.split(/[^a-z0-9]+/i).filter(Boolean);
+  return tokens.every(tok => normText.includes(tok));
+}
+
 function paged<T>(items: T[], limit = 100) { return items.slice(0, Math.max(1, limit)); }
 function addLog(input: Omit<LogEntry, 'request_id' | 'timestamp'>) {
   const entry: LogEntry = { ...input, request_id: requestId(), timestamp: new Date().toISOString() };
@@ -202,14 +243,68 @@ function videoPath(video: VideoInfo) {
   return null;
 }
 
-function validateLimit(value: unknown, fallback = 100, max?: number) {
-  const n = value === undefined ? fallback : Number(value);
-  if (!Number.isInteger(n) || n < 1 || (max !== undefined && n > max)) throw new ValidationError('limit must be a positive integer');
-  return n;
-}
 class ValidationError extends Error { status = 422; }
 function jsonError(res: Response, status: number, message: string) {
   res.status(status).json({ detail: [{ loc: [], msg: message, type: 'value_error' }] });
+}
+
+function validateLimit(value: unknown, fallback: number, min?: number, max?: number) {
+  const n = value === undefined ? fallback : Number(value);
+  if (!Number.isInteger(n)) throw new ValidationError('limit must be an integer');
+  if (min !== undefined && n < min) throw new ValidationError(`limit must be >= ${min}`);
+  if (max !== undefined && n > max) throw new ValidationError(`limit must be <= ${max}`);
+  return n;
+}
+function validateRange(value: unknown, name: string, min: number, max: number, fallback: number) {
+  const n = value === undefined ? fallback : Number(value);
+  if (typeof n !== 'number' || Number.isNaN(n) || n < min || n > max) throw new ValidationError(`${name} must be a number between ${min} and ${max}`);
+  return n;
+}
+function validateMinInt(value: unknown, name: string, min: number, fallback: number) {
+  const n = value === undefined ? fallback : Number(value);
+  if (!Number.isInteger(n) || n < min) throw new ValidationError(`${name} must be an integer >= ${min}`);
+  return n;
+}
+function validateNonNegIntOrNull(value: unknown, name: string, fallback: number | null) {
+  if (value === undefined) return fallback;
+  if (value === null) return null;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) throw new ValidationError(`${name} must be a non-negative integer or null`);
+  return n;
+}
+function validateWeights(value: unknown, name: string, expectedLength: number) {
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value) || value.length !== expectedLength || value.some(v => typeof v !== 'number')) {
+    throw new ValidationError(`${name} must be an array of ${expectedLength} numbers, matching the number of stages`);
+  }
+  return value as number[];
+}
+
+function validateEnumOrDefault<T extends string>(value: unknown, name: string, allowed: readonly T[], fallback: T): T {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== 'string' || !(allowed as readonly string[]).includes(value)) {
+    throw new ValidationError(`${name} must be one of: ${allowed.join(', ')}`);
+  }
+  return value as T;
+}
+function validateConstOrDefault(value: unknown, name: string, expected: 'gte') {
+  if (value === undefined || value === null) return expected;
+  if (value !== expected) throw new ValidationError(`${name} must be "${expected}"`);
+  return expected;
+}
+
+function buildDetectObjects(objects: unknown): DetectObjectNorm[] {
+  if (!Array.isArray(objects) || objects.length < 1) throw new ValidationError('objects must contain at least 1 item');
+  return objects.map((o: any, i: number) => {
+    if (typeof o?.phrase !== 'string' || !o.phrase) throw new ValidationError(`objects[${i}].phrase is required`);
+    const min_count = validateMinInt(o.min_count, `objects[${i}].min_count`, 1, 1);
+    const min_score = validateRange(o.min_score, `objects[${i}].min_score`, 0, 1, 0.25);
+    const min_area = validateRange(o.min_area, `objects[${i}].min_area`, 0, 1, 0);
+    const max_area = validateRange(o.max_area, `objects[${i}].max_area`, 0, 1, 1);
+    const region: Region | null = o.region ?? null;
+    if (region !== null && !REGIONS.has(region)) throw new ValidationError(`objects[${i}].region must be one of left, right, center, top, bottom`);
+    return { phrase: o.phrase, min_count, min_score, region, min_area, max_area };
+  });
 }
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
@@ -284,18 +379,23 @@ app.get('/keyframe/:video_id/:keyframe_id', async (req, res, next) => {
   }
 });
 
-app.post('/query/keyframe', async (req, res) => {
-  const { query } = req.body ?? {};
-  if (typeof query !== 'string') return jsonError(res, 422, 'query is required');
-  const randomDelay = Math.floor(Math.random() * 800) + 200;
-  await delay(randomDelay);
-  const limit = validateLimit(req.body.limit, 100);
-  const model: SimilarModel = ['siglip', 'siglip2', 'pe'].includes(req.body.model) ? req.body.model : 'siglip2';
-  const all = VIDEOS.flatMap(v => keyframesFor(v).map(k => ({ ...k, score: scoreFor(query, k.keyframe_id, model) })));
-  all.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  const results = paged(all, limit);
-  const entry = addLog({ query, limit, mode: 'keyframe', model, results, total: all.length });
-  res.json({ request_id: entry.request_id, mode: 'keyframe', model, total: all.length, results });
+app.post('/query/keyframe', async (req, res, next) => {
+  try {
+    const { query } = req.body ?? {};
+    if (typeof query !== 'string') return jsonError(res, 422, 'query is required');
+    const limit = validateLimit(req.body.limit, 100);
+    const model = validateEnumOrDefault(req.body.model, 'model', CORE_MODELS, 'siglip2');
+    const randomDelay = Math.floor(Math.random() * 800) + 200;
+    await delay(randomDelay);
+    const all = VIDEOS.flatMap(v => keyframesFor(v).map(k => ({ ...k, score: scoreFor(query, k.keyframe_id, model) })));
+    all.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    const results = paged(all, limit);
+    const entry = addLog({ query, limit, mode: 'keyframe', model, results, total: all.length });
+    res.json({ request_id: entry.request_id, mode: 'keyframe', model, total: all.length, results });
+  } catch (e) {
+    if (e instanceof ValidationError) return jsonError(res, 422, e.message);
+    next(e);
+  }
 });
 
 function transcriptResults(query: string, limit: number, semantic: boolean) {
@@ -305,7 +405,7 @@ function transcriptResults(query: string, limit: number, semantic: boolean) {
     for (let i = 0; i < Math.ceil(video.durationMs / 15000); i++) {
       const start = i * 15000;
       const text = `${lorem(i + video.id.length)} ${lorem(i + 2)}`;
-      if (!semantic && !matchesText(text, query, Boolean(false))) continue;
+      if (!semantic && !matchesText(text, query, false)) continue;
       if (semantic || matchesText(text, query, false)) {
         const keyframes = nearestKeyframes(video, start, Math.min(start + 15000, video.durationMs)).slice(0, 3);
         out.push({ video_id: video.id, transcript_id: `${video.id}-tr-${String(i + 1).padStart(4, '0')}`, text, time_start_ms: start, time_end_ms: Math.min(start + 15000, video.durationMs), keyframes });
@@ -315,64 +415,85 @@ function transcriptResults(query: string, limit: number, semantic: boolean) {
   return out.map((x, i) => semantic ? ({ ...x, _score: scoreFor(query, x.transcript_id) }) : x);
 }
 
-app.post('/query/transcript/semantic', async (req, res) => {
-  if (typeof req.body?.query !== 'string') return jsonError(res, 422, 'query is required');
-  const randomDelay = Math.floor(Math.random() * 800) + 200;
-  await delay(randomDelay);
-  const query = req.body.query; const limit = validateLimit(req.body.limit); const model = 'gte' as const;
-  const raw = transcriptResults(query, limit, true) as (TranscriptItem & { _score?: number })[];
-  raw.sort((a, b) => (b._score ?? 0) - (a._score ?? 0));
-  const results = raw.slice(0, limit).map(({ _score, ...x }) => x);
-  const total = raw.length; const entry = addLog({ query, limit, mode: 'transcript_semantic', model, results, total });
-  res.json({ request_id: entry.request_id, mode: 'transcript_semantic', model, total, results });
+app.post('/query/transcript/semantic', async (req, res, next) => {
+  try {
+    if (typeof req.body?.query !== 'string') return jsonError(res, 422, 'query is required');
+    const query = req.body.query;
+    const limit = validateLimit(req.body.limit, 100);
+    const model = validateConstOrDefault(req.body.model, 'model', 'gte');
+    const randomDelay = Math.floor(Math.random() * 800) + 200;
+    await delay(randomDelay);
+    const raw = transcriptResults(query, limit, true) as (TranscriptItem & { _score?: number })[];
+    raw.sort((a, b) => (b._score ?? 0) - (a._score ?? 0));
+    const results = raw.slice(0, limit).map(({ _score, ...x }) => x);
+    const total = raw.length; const entry = addLog({ query, limit, mode: 'transcript_semantic', model, results, total });
+    res.json({ request_id: entry.request_id, mode: 'transcript_semantic', model, total, results });
+  } catch (e) {
+    if (e instanceof ValidationError) return jsonError(res, 422, e.message);
+    next(e);
+  }
 });
 
-app.post('/query/transcript/exact', async (req, res) => {
-  if (typeof req.body?.query !== 'string') return jsonError(res, 422, 'query is required');
-  const randomDelay = Math.floor(Math.random() * 800) + 200;
-  await delay(randomDelay);
-  const query = req.body.query; const limit = validateLimit(req.body.limit); const phrase = Boolean(req.body.phrase);
-  const results = VIDEOS.flatMap(v => keyframesFor(v).filter((k, i) => matchesText(`${lorem(i + v.id.length)} ${lorem(i + 2)}`, query, phrase)).map((k, i) => ({
-    video_id: v.id, transcript_id: `${v.id}-tr-${String(i + 1).padStart(4, '0')}`, text: `${lorem(i + v.id.length)} ${lorem(i + 2)}`,
-    time_start_ms: k.timestamp_ms, time_end_ms: Math.min(k.timestamp_ms + 5000, v.durationMs), keyframes: [k]
-  })));
-  const pagedResults = paged(results, limit); const entry = addLog({ query, limit, mode: 'transcript_exact', model: null, results: pagedResults, total: results.length });
-  res.json({ request_id: entry.request_id, mode: 'transcript_exact', model: null, total: results.length, results: pagedResults });
+app.post('/query/transcript/exact', async (req, res, next) => {
+  try {
+    if (typeof req.body?.query !== 'string') return jsonError(res, 422, 'query is required');
+    const query = req.body.query;
+    const limit = validateLimit(req.body.limit, 100);
+    const fuzzy = req.body.fuzzy === undefined ? true : Boolean(req.body.fuzzy);
+    const randomDelay = Math.floor(Math.random() * 800) + 200;
+    await delay(randomDelay);
+    const results = VIDEOS.flatMap(v => keyframesFor(v).filter((k, i) => matchesTextFlexible(`${lorem(i + v.id.length)} ${lorem(i + 2)}`, query, fuzzy)).map((k, i) => ({
+      video_id: v.id, transcript_id: `${v.id}-tr-${String(i + 1).padStart(4, '0')}`, text: `${lorem(i + v.id.length)} ${lorem(i + 2)}`,
+      time_start_ms: k.timestamp_ms, time_end_ms: Math.min(k.timestamp_ms + 5000, v.durationMs), keyframes: [k]
+    })));
+    const pagedResults = paged(results, limit); const entry = addLog({ query, limit, mode: 'transcript_exact', model: null, results: pagedResults, total: results.length });
+    res.json({ request_id: entry.request_id, mode: 'transcript_exact', model: null, total: results.length, results: pagedResults });
+  } catch (e) {
+    if (e instanceof ValidationError) return jsonError(res, 422, e.message);
+    next(e);
+  }
 });
 
 app.post('/query/ocr', (req, res) => {
-  if (typeof req.body?.query !== 'string') return jsonError(res, 422, 'query is required');
-  const query = req.body.query; const limit = validateLimit(req.body.limit); const phrase = Boolean(req.body.phrase);
-  const raw: OcrItem[] = VIDEOS.flatMap(v => keyframesFor(v).map((k, i) => ({ ...k, score: scoreFor(query, k.keyframe_id), text: `${lorem(i)} ${lorem(i + 1)}` }))).filter(x => matchesText(x.text, query, phrase));
-  const results = paged(raw.sort((a, b) => b.score - a.score), limit); const entry = addLog({ query, limit, mode: 'ocr_exact', model: null, results, total: raw.length });
-  res.json({ request_id: entry.request_id, mode: 'ocr_exact', model: null, total: raw.length, results });
+  try {
+    if (typeof req.body?.query !== 'string') return jsonError(res, 422, 'query is required');
+    const query = req.body.query;
+    const limit = validateLimit(req.body.limit, 100);
+    const fuzzy = req.body.fuzzy === undefined ? true : Boolean(req.body.fuzzy);
+    const raw: OcrItem[] = VIDEOS.flatMap(v => keyframesFor(v).map((k, i) => ({ ...k, score: scoreFor(query, k.keyframe_id), text: `${lorem(i)} ${lorem(i + 1)}` }))).filter(x => matchesTextFlexible(x.text, query, fuzzy));
+    const results = paged(raw.sort((a, b) => b.score - a.score), limit); const entry = addLog({ query, limit, mode: 'ocr_exact', model: null, results, total: raw.length });
+    res.json({ request_id: entry.request_id, mode: 'ocr_exact', model: null, total: raw.length, results });
+  } catch (e) {
+    if (e instanceof ValidationError) return jsonError(res, 422, e.message);
+    throw e;
+  }
 });
 
-function temporalFromStages(stages: Array<{ query: string; variants?: string[] }>, limit: number, mode: 'temporal' | 'temporal_detect', model: QueryModel) {
+function temporalFromStages(stages: Array<{ query: string; variants?: string[] }>, limit: number, mode: 'temporal' | 'temporal_detect', model: QueryModel, seed: number) {
   const targetCount = Math.max(VIDEOS.length, Math.ceil(limit * 3 / 8));
   const results: TemporalItem[] = [];
 
   for (let i = 0; i < targetCount; i++) {
-    const video = VIDEOS[i % VIDEOS.length];
+    const video = VIDEOS[(i + seed) % VIDEOS.length];
     const offsetIndex = Math.floor(i / VIDEOS.length);
-    
+
     const matches: TemporalMatch[] = stages.map((s, si) => {
-      const kfs = keyframesFor(video); 
-      const idx = Math.min(kfs.length - 1, si * 3 + offsetIndex); 
+      const kfs = keyframesFor(video);
+      const idx = Math.min(kfs.length - 1, si * 3 + offsetIndex);
       const k = kfs[idx];
-      return { 
-        ...k, 
-        score: scoreFor(s.query, video.id, String(si), String(i)), 
-        stage: si, 
-        query: s.query, 
-        rank: idx + 1 
+      return {
+        ...k,
+        score: scoreFor(s.query, video.id, String(si), String(i), String(seed)),
+        stage: si,
+        query: s.query,
+        rank: idx + 1
       };
     });
 
     results.push({
       rank: i + 1,
       video_id: video.id,
-      score: scoreFor(video.id, JSON.stringify(stages), model, String(i)),
+      score: scoreFor(video.id, JSON.stringify(stages), model, String(i), String(seed)),
       length: stages.length,
       matches,
       skipped_stages: [] as number[]
@@ -383,98 +504,149 @@ function temporalFromStages(stages: Array<{ query: string; variants?: string[] }
 }
 
 app.post('/query/temporal', async (req, res) => {
-  const randomDelay = Math.floor(Math.random() * 800) + 700;
-  await delay(randomDelay);
-  if (!Array.isArray(req.body?.stages) || req.body.stages.length < 2) return jsonError(res, 422, 'stages must contain at least 2 items');
-  const limit = validateLimit(req.body.limit); const model: QueryModel = req.body.model ?? 'siglip2';
-  const results = temporalFromStages(req.body.stages, limit, 'temporal', model); const entry = addLog({ query: JSON.stringify(req.body.stages), limit, mode: 'temporal', model, results, total: VIDEOS.length });
-  res.json({ mode: 'temporal', results });
-});
+  try {
+    if (!Array.isArray(req.body?.stages) || req.body.stages.length < 2) throw new ValidationError('stages must contain at least 2 items');
 
-function buildDetectObjects(req: any) {
-  if (!Array.isArray(req?.objects) || req.objects.length < 1) throw new ValidationError('objects must contain at least 1 item');
-  return req.objects as Array<{ phrase: string; min_count?: number; min_score?: number; region?: string | null; min_area?: number; max_area?: number }>;
-}
+    const limit = validateLimit(req.body.limit, 100);
+    const model = validateEnumOrDefault(req.body.model, 'model', TEMPORAL_MODELS, 'siglip2');
+    const seed = validateMinInt(req.body.seed, 'seed', 0, 0);
+    validateMinInt(req.body.chains_per_video, 'chains_per_video', 1, 1);
+    validateMinInt(req.body.r, 'r', 1, 2000);
+    if (req.body.rrf_k !== undefined && Number.isNaN(Number(req.body.rrf_k))) throw new ValidationError('rrf_k must be a number');
+    validateWeights(req.body.weights, 'weights', req.body.stages.length);
+    validateNonNegIntOrNull(req.body.max_gap_ms, 'max_gap_ms', 120000);
+    validateRange(req.body.iou_threshold, 'iou_threshold', 0, 1, 0.5);
+
+    const randomDelay = Math.floor(Math.random() * 800) + 700;
+    await delay(randomDelay);
+
+    const results = temporalFromStages(req.body.stages, limit, 'temporal', model, seed);
+    addLog({ query: JSON.stringify(req.body.stages), limit, mode: 'temporal', model, results, total: VIDEOS.length });
+    res.json({ mode: 'temporal', results });
+  } catch (e) {
+    if (e instanceof ValidationError) return jsonError(res, 422, e.message);
+    throw e;
+  }
+});
 
 app.post('/query/detect', (req, res) => {
   try {
-    const objects = buildDetectObjects(req.body); const limit = validateLimit(req.body.limit); const model = (req.body.model ?? 'owlv2-base') as 'owlv2-base' | 'owlv2-large';
-    const all: any[] = VIDEOS.flatMap(v => keyframesFor(v).map((k, i) => ({ ...k, score: scoreFor(JSON.stringify(objects), k.keyframe_id), counts: objects.map(() => 1), boxes: objects.map((_, oi) => [[0.1 + oi * 0.1, 0.1, 0.4 + oi * 0.1, 0.4, 0.8]]) })));
-    all.sort((a, b) => b.score - a.score); const results = paged(all, limit); const entry = addLog({ query: JSON.stringify(req.body), limit, mode: 'detect', model, results, total: all.length });
+    const objects = buildDetectObjects(req.body?.objects);
+    const limit = validateLimit(req.body.limit, 100, 1);
+    const model = validateEnumOrDefault(req.body.model, 'model', DETECT_MODELS, 'owlv2-base');
+    validateRange(req.body.nms_iou, 'nms_iou', 0, 1, 0.5);
+
+    let candidates = allKeyframesFlat();
+    if (req.body.prefilter !== undefined && req.body.prefilter !== null) {
+      const pf = req.body.prefilter;
+      if (typeof pf.query !== 'string' || !pf.query) throw new ValidationError('prefilter.query is required');
+      const pfModel = validateEnumOrDefault(pf.model, 'prefilter.model', CORE_MODELS, 'siglip2');
+      const pfLimit = validateMinInt(pf.limit, 'prefilter.limit', 1, 2000);
+      candidates = candidates
+        .map(k => ({ k, s: scoreFor(pf.query, k.keyframe_id, pfModel) }))
+        .sort((a, b) => b.s - a.s)
+        .slice(0, pfLimit)
+        .map(x => x.k);
+    }
+
+    const all = candidates
+      .map(k => ({
+        ...k,
+        score: scoreFor(JSON.stringify(objects), k.keyframe_id),
+        counts: objects.map(o => o.min_count),
+        boxes: objects.map((_, oi) => [[0.1 + oi * 0.1, 0.1, 0.4 + oi * 0.1, 0.4, 0.8]]),
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    const results = paged(all, limit);
+    const entry = addLog({ query: JSON.stringify(req.body), limit, mode: 'detect', model, results, total: all.length });
     res.json({ request_id: entry.request_id, mode: 'detect', model, total: all.length, results });
-  } catch (e) { if (e instanceof ValidationError) return jsonError(res, 422, e.message); throw e; }
+  } catch (e) {
+    if (e instanceof ValidationError) return jsonError(res, 422, e.message);
+    throw e;
+  }
 });
 
 app.post('/query/temporal/detect', (req, res) => {
   try {
     if (!Array.isArray(req.body?.stages) || req.body.stages.length < 2) throw new ValidationError('stages must contain at least 2 items');
-    for (const stage of req.body.stages) buildDetectObjects(stage);
-    const limit = validateLimit(req.body.limit); const model = (req.body.model ?? 'owlv2-base') as 'owlv2-base' | 'owlv2-large';
-    const stages = req.body.stages.map((s: any, i: number) => ({ query: s.objects.map((o: any) => o.phrase).join(', '), variants: [], stageIndex: i }));
-    const results = temporalFromStages(stages, limit, 'temporal_detect', model); const entry = addLog({ query: JSON.stringify(req.body), limit, mode: 'temporal_detect', model, results, total: results.length });
+    const normalizedStages = req.body.stages.map((s: any) => ({ objects: buildDetectObjects(s?.objects) }));
+
+    const limit = validateLimit(req.body.limit, 100, 1);
+    const model = validateEnumOrDefault(req.body.model, 'model', DETECT_MODELS, 'owlv2-base');
+    const seed = validateMinInt(req.body.seed, 'seed', 0, 0);
+    validateRange(req.body.nms_iou, 'nms_iou', 0, 1, 0.5);
+    validateMinInt(req.body.r, 'r', 1, 5000);
+    if (req.body.rrf_k !== undefined && Number.isNaN(Number(req.body.rrf_k))) throw new ValidationError('rrf_k must be a number');
+    validateWeights(req.body.weights, 'weights', req.body.stages.length);
+    validateNonNegIntOrNull(req.body.max_gap_ms, 'max_gap_ms', 120000);
+    validateRange(req.body.iou_threshold, 'iou_threshold', 0, 1, 0.5);
+    validateMinInt(req.body.chains_per_video, 'chains_per_video', 1, 1);
+
+    const stages = normalizedStages.map((s: { objects: DetectObjectNorm[] }, i: number) => ({
+      query: s.objects.map(o => o.phrase).join(', '),
+      variants: [],
+      stageIndex: i,
+    }));
+    const results = temporalFromStages(stages, limit, 'temporal_detect', model, seed);
+    const entry = addLog({ query: JSON.stringify(req.body), limit, mode: 'temporal_detect', model, results, total: results.length });
     res.json({ request_id: entry.request_id, mode: 'temporal_detect', model, total: results.length, results });
-  } catch (e) { if (e instanceof ValidationError) return jsonError(res, 422, e.message); throw e; }
+  } catch (e) {
+    if (e instanceof ValidationError) return jsonError(res, 422, e.message);
+    throw e;
+  }
 });
 
-app.get('/similar/:video_id/:keyframe_id', (req, res) => {
-  const k = keyframeById(req.params.video_id, req.params.keyframe_id);
-  if (!k) return res.status(404).send('Not found');
-  const model = (['siglip', 'siglip2', 'pe'].includes(String(req.query.model)) ? req.query.model : 'siglip2') as SimilarModel;
-  const limit = validateLimit(req.query.limit, 100);
-  const all = VIDEOS.flatMap(v => keyframesFor(v).map(x => ({ ...x, score: scoreFor(k.keyframe_id, x.keyframe_id, model) }))).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  res.json({ video_id: k.video_id, keyframe_id: k.keyframe_id, model, total: all.length, results: paged(all, limit) });
-});
+const SEMANTIC_MODELS = CORE_MODELS;
+const VISUAL_MODELS = ['dinov3'] as const;
+
+type SimilarParams = { video_id: string; keyframe_id: string };
+
+function similarByKeyframeHandler<T extends readonly SimilarModel[]>(allowed: T, defaultModel: T[number]) {
+  return (req: Request<SimilarParams>, res: Response) => {
+    try {
+      const k = keyframeById(req.params.video_id, req.params.keyframe_id);
+      if (!k) return res.status(404).send('Not found');
+      const model = validateEnumOrDefault(req.query.model, 'model', allowed, defaultModel);
+      const limit = validateLimit(req.query.limit, 100);
+      const all = VIDEOS.flatMap(v => keyframesFor(v).map(x => ({ ...x, score: scoreFor(k.keyframe_id, x.keyframe_id, model) }))).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+      res.json({ video_id: k.video_id, keyframe_id: k.keyframe_id, model, total: all.length, results: paged(all, limit) });
+    } catch (e) {
+      if (e instanceof ValidationError) return jsonError(res, 422, e.message);
+      throw e;
+    }
+  };
+}
+
+app.get('/similar/semantic/:video_id/:keyframe_id', similarByKeyframeHandler(SEMANTIC_MODELS, 'siglip2'));
+app.get('/similar/visual/:video_id/:keyframe_id', similarByKeyframeHandler(VISUAL_MODELS, 'dinov3'));
 
 app.post('/similar/upload', upload.single('file'), (req, res) => {
-  const model = (['siglip', 'siglip2', 'pe'].includes(String(req.query.model)) ? req.query.model : 'siglip2') as SimilarModel;
-  const limit = validateLimit(req.query.limit, 100);
-  if (!req.file) return jsonError(res, 422, 'file is required');
-  const all = VIDEOS.flatMap(v => keyframesFor(v).map(x => ({ ...x, score: scoreFor(req.file!.originalname, x.keyframe_id, model) }))).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  res.json({ video_id: 'upload', keyframe_id: req.file.originalname, model, total: all.length, results: paged(all, limit) });
+  try {
+    const model = validateEnumOrDefault(req.query.model, 'model', SIMILAR_MODELS, 'siglip2');
+    const limit = validateLimit(req.query.limit, 100);
+    if (!req.file) return jsonError(res, 422, 'file is required');
+    const all = VIDEOS.flatMap(v => keyframesFor(v).map(x => ({ ...x, score: scoreFor(req.file!.originalname, x.keyframe_id, model) }))).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    res.json({ video_id: 'upload', keyframe_id: req.file.originalname, model, total: all.length, results: paged(all, limit) });
+  } catch (e) {
+    if (e instanceof ValidationError) return jsonError(res, 422, e.message);
+    throw e;
+  }
 });
 
 app.get('/logs', (req, res) => {
-  const limit = validateLimit(req.query.limit, 50, 500); const offset = Number(req.query.offset ?? 0);
-  res.json(logs.slice(offset, offset + limit));
+  try {
+    const limit = validateLimit(req.query.limit, 50, 1, 500); const offset = Number(req.query.offset ?? 0);
+    res.json(logs.slice(offset, offset + limit));
+  } catch (e) {
+    if (e instanceof ValidationError) return jsonError(res, 422, e.message);
+    throw e;
+  }
 });
 app.get('/logs/:request_id', (req, res) => {
   const found = logs.find(x => x.request_id === req.params.request_id);
   if (!found) return res.status(404).send('Not found');
   res.json(found);
-});
-
-let sharedText = '';
-let lastWhisperSetTime = 0;
-
-app.post('/whisper', (req, res) => {
-  const { message } = req.body ?? {};
-  if (typeof message !== 'string') {
-    return jsonError(res, 422, 'message is required and must be a string');
-  }
-
-  const now = Date.now();
-  const cooldownMs = 3000;
-  if (now - lastWhisperSetTime < cooldownMs) {
-    const remaining = Math.ceil(cooldownMs - (now - lastWhisperSetTime));
-    return res.status(429).json({
-      detail: `Cooldown active. Please wait ${remaining}ms before setting the whisper text again.`
-    });
-  }
-
-  sharedText = message;
-  lastWhisperSetTime = now;
-
-  res.json({ status: 'ok', message: sharedText });
-});
-
-app.get('/whisper', (req, res) => {
-  // If you also want to support checking or passing a message via query/body:
-  const queryMessage = req.body?.message ?? req.query?.message;
-  
-  res.json({
-    message: sharedText,
-    match: queryMessage !== undefined ? sharedText === queryMessage : undefined
-  });
 });
 
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
